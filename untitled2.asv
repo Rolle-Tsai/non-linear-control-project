@@ -1,0 +1,107 @@
+clear; clc;
+
+%% ---------------- 基本設定 ----------------
+Ts   = 0.01;                  % 取樣時間
+tend = 30;
+t    = 0:Ts:tend;
+N    = numel(t);
+
+% 物理參數
+m = 2; 
+g = 9.8; 
+K3 = 0.01;                    % z 方向線性阻尼
+beta_hat_z = sqrt(0.2);       % 等效推力增益（可視為辨識值）
+beta_min_z = sqrt (0.2);
+eta_1 = 2; %corresonding to eta_z designed controller  
+
+
+% 若只做 z 軸，先固定姿態 = 0（等效 cos(phi)*cos(theta)=1）
+params.m = m; 
+params.g = g; 
+params.K3 = K3; 
+params.beta_hat_z = beta_hat_z;
+params.phi = 0; 
+params.theta = 0;
+
+%% ---------------- 參考軌跡 ----------------
+z_ref     = ones(1, N);                     % 懸停 1 m
+z_ref(round(N/2):end) = 2;                  % 中途切到 2 m
+z_ref_dot = zeros(1, N);                    % 參考速度（這裡取 0，如需可自行給）
+
+%% ---------------- 陣列預配置 ----------------
+z     = zeros(1, N);      % 位置
+z_dot = zeros(1, N);      % 速度
+U     = zeros(4, N);      % 控制輸入（只用 u1，其餘為 0）
+
+%% ---------------- 初始條件 ----------------
+z(1)     = 0;             % 初始高度
+z(2)     = z(1);          % 二階差分需兩點
+z_dot(1) = 0;
+z_dot(2) = 0;
+
+u1_hover = m*g / beta_hat_z;
+U(1,1) = u1_hover;
+U(1,2) = u1_hover;
+
+%% ---------------- SMC 參數（離散型） ----------------
+% s(k) = c1*e_z(k) + c2*e_z_dot(k)
+cz = 1.0;             % 這兩個等同連續面的權重，但我們直接用在離散誤差
+% 推力飽和
+u1_min = 0.1; 
+u1_max = 100;
+
+%% ---------------- 主迴圈（k = 2 ... N-1） ----------------
+for k = 2:N-1
+    % 1) 這一步可用的控制（ZOH）：u1_now
+    u1_now = U(1,k);
+
+    % 2) 用當步狀態計算 z 向加速度 a_z(k)
+    a_z = accel_z( z(k), z_dot(k), u1_now, params );
+
+    % 3) 二階差分更新位置（全離散）
+    z(k+1) = 2*z(k) - z(k-1) + Ts^2 * a_z;
+
+    % 4) 速度更新（中央差分；若要「一階 hold」可以改）
+    z_dot(k+1) = (z(k+1) - z(k))/(Ts);
+    % 若你想要後向差分（更穩）：
+    % z_dot(k+1) = (z(k+1) - z(k))/Ts;
+
+    % 5) SMC 控制律（完全離散，使用 e_z(k), e_z_dot(k)）
+    e_z     = z(k)     - z_ref(k);
+    e_z_dot = z_dot(k) - z_ref_dot(k);
+    s_z       = cz*e_z + e_z_dot;
+
+    %全離散設計eta_z for some eta are a positive constant
+    eta_z = (1-beta_min_z)*(abs(-g -(z(k+1)-z(k)*(K3/m -cz))/Ts))+eta_1/beta_min_z;
+    %% 
+    u1_next = m*(g+(z(k+1)-z(k))*(K3/m -cz)/Ts -eta_z*sign(s_z))/beta_hat_z;
+
+    % 7) 飽和 & 存入下一步
+    U(1, k+1) = min(max(u1_next, u1_min), u1_max);
+end
+
+%% ---------------- 繪圖 ----------------
+figure; 
+subplot(2,1,1);
+plot(t, z, 'b', 'LineWidth', 1.6); hold on;
+plot(t, z_ref, 'r--', 'LineWidth', 1.2);
+grid on; xlabel('Time (s)'); ylabel('z (m)');
+legend('z','z_{ref}'); title('Z position');
+
+subplot(2,1,2);
+plot(t, U(1,:), 'k', 'LineWidth', 1.6); grid on;
+xlabel('Time (s)'); ylabel('u_1 (N)');
+title('Thrust u_1');
+
+%% ---------------- 輔助函數 ----------------
+function a_z = accel_z(z, z_dot, u1, params)
+    % 當步的等效 z 向加速度（完全離散：只吃當步 z, z_dot, u1）
+    m = params.m; g = params.g; K3 = params.K3; beta_hat_z = params.beta_hat_z;
+    cphi = cos(params.phi); cth = cos(params.theta);
+
+    thrust = beta_hat_z * (u1/m) * cphi * cth; % 推力等效加速度
+    drag   = (K3/m) * z_dot;                   % 線性阻尼
+    a_z = thrust - g - drag;
+end
+
+
